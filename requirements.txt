@@ -1,0 +1,28 @@
+langchain-text-splitters
+langchain-google-genai
+langchain-pinecone
+langchain-community
+langchain-huggingface 
+huggingface-hub
+langchain
+langchain-core
+pinecone
+pymupdf
+tqdm
+dotenv
+fastapi
+uvicorn
+pytesseract
+pillow
+supabase
+beautifulsoup4
+asyncpg
+# uv pip install curl-cffi --only-binary=:all: --break-system-packages
+# browser-cookie3
+tabulate
+duckdb
+groq
+pandas
+cohere
+pinecone-text
+redis
