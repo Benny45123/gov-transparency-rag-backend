@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from typing import Any, cast
 
 import redis
 from redis.exceptions import RedisError
@@ -90,7 +90,12 @@ class RedisQueryCache:
         if not client: return 0
         try:
             keys = client.keys("rag:cache:*")
-            return client.delete(*keys) if keys else 0
+            # If keys is not a concrete iterable (e.g. an awaitable from an async client), avoid unpacking.
+            if not isinstance(keys, (list, tuple)) or not keys:
+                return 0
+            # client.delete may be typed as returning an Awaitable in some redis clients; cast to int for static typing.
+            res = client.delete(*keys)
+            return cast(int, res)
         except RedisError:
             return 0
 

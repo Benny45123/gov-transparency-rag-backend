@@ -1,11 +1,11 @@
 langchain-text-splitters
 langchain-google-genai
-langchain-pinecone
+langchain-pinecone>=0.1.0
+langchain-core>=0.2.0
 langchain-community
 langchain-huggingface 
 huggingface-hub
 langchain
-langchain-core
 pinecone
 pymupdf
 tqdm
