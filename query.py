@@ -18,19 +18,32 @@ Full pipeline:
 from __future__ import annotations
 
 import threading
+import json
+import re
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Iterator, Sequence
 
 from langchain_pinecone import PineconeVectorStore
 
 from cache import get_cache
 from config import cfg
-from database import save_query
-from generator import build_prompt, generate_answer, stream_answer
+from database import fetch_history, save_query
+from generator import build_prompt, generate_answer, rewrite_query, stream_answer
 from observability import Tracer, get_logger
 from retriever import RetrievedChunk, build_vector_store, retrieve_chunks, rerank_chunks
 
 log = get_logger(__name__)
+
+MAX_MEMORY_MESSAGES = 10
+
+_GREETING_RE = re.compile(
+    r"^\s*(hi|hello|hey|yo|thanks|thank you|good morning|good afternoon|good evening)[!.?\s]*$",
+    re.IGNORECASE,
+)
+_CONTINUATION_RE = re.compile(
+    r"\b(continue|extend|expand|elaborate|explain more|more detail|more details|previous|last answer|earlier)\b",
+    re.IGNORECASE,
+)
 
 
 # ── Response schema ────────────────────────────────────────────────────────────
@@ -66,6 +79,196 @@ _NO_CHUNKS_RESPONSE = RAGResponse(
     answer="No relevant documents were found in the database for this query.",
 )
 
+_GREETING_RESPONSE = RAGResponse(
+    answer="Hello. Ask me a question about the court document excerpts, and I will answer with cited sources.",
+)
+
+_MISSING_HISTORY_RESPONSE = RAGResponse(
+    answer=(
+        "I do not have enough previous conversation context to extend. "
+        "Please include a conversation_id from the earlier chat or restate the topic."
+    ),
+)
+
+
+def _cache_key(question: str, history: Sequence[dict] | None = None) -> str:
+    history_payload = [
+        {
+            "role": item.get("role"),
+            "content": item.get("content"),
+        }
+        for item in (history or [])
+    ]
+    return json.dumps(
+        {"question": question, "history": history_payload},
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+
+
+def _scoped_cache_key(
+    question: str,
+    history: Sequence[dict] | None = None,
+    *,
+    conversation_id: str | None = None,
+    retrieval_query: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "question": question,
+            "retrieval_query": retrieval_query or question,
+            "conversation_id": conversation_id,
+            "history": _clean_history(history),
+        },
+        sort_keys=True,
+        ensure_ascii=True,
+    )
+
+
+def _clean_history(history: Sequence[dict] | None) -> list[dict[str, str]]:
+    cleaned: list[dict[str, str]] = []
+    for item in history or []:
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            cleaned.append({"role": role, "content": content})
+    return cleaned[-MAX_MEMORY_MESSAGES:]
+
+
+def _history_from_db(
+    *,
+    conversation_id: str,
+    namespace: str,
+    limit: int = MAX_MEMORY_MESSAGES,
+) -> list[dict[str, str]]:
+    rows = fetch_history(
+        limit=max(1, limit // 2),
+        namespace=namespace,
+        conversation_id=conversation_id,
+    )
+    messages: list[dict[str, str]] = []
+    for row in reversed(rows):
+        question = (row.get("question") or "").strip()
+        answer = (row.get("answer") or "").strip()
+        if question:
+            messages.append({"role": "user", "content": question})
+        if answer and not row.get("error"):
+            messages.append({"role": "assistant", "content": answer})
+    return _clean_history(messages)
+
+
+def _resolve_history(
+    cache,
+    *,
+    explicit_history: Sequence[dict] | None,
+    conversation_id: str | None,
+    namespace: str,
+) -> list[dict[str, str]]:
+    cleaned = _clean_history(explicit_history)
+    if cleaned or not conversation_id:
+        return cleaned
+
+    cached_history = _clean_history(
+        cache.get_conversation_history(conversation_id, namespace=namespace)
+    )
+    if cached_history:
+        return cached_history
+
+    db_history = _history_from_db(conversation_id=conversation_id, namespace=namespace)
+    if db_history:
+        cache.set_conversation_history(
+            conversation_id,
+            db_history,
+            namespace=namespace,
+        )
+    return db_history
+
+
+def _remember_turn(
+    cache,
+    *,
+    conversation_id: str | None,
+    namespace: str,
+    history: Sequence[dict] | None,
+    question: str,
+    answer: str,
+) -> None:
+    if not conversation_id:
+        return
+
+    updated = _clean_history(
+        [
+            *list(history or []),
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ]
+    )
+    cache.set_conversation_history(conversation_id, updated, namespace=namespace)
+
+
+def _rewrite_for_retrieval(question: str, history: Sequence[dict] | None) -> str:
+    if _is_greeting(question):
+        return question
+
+    if _is_continuation_request(question):
+        previous_question = _last_substantive_user_question(history, current_question=question)
+        if previous_question:
+            return f"{previous_question} more details"
+
+    if not history:
+        return question
+    try:
+        return rewrite_query(question, history).strip() or question
+    except Exception as e:
+        log.warning("Query rewrite failed; using raw question: %s", e)
+        return question
+
+
+def _is_greeting(question: str) -> bool:
+    return bool(_GREETING_RE.fullmatch(question or ""))
+
+
+def _is_continuation_request(question: str) -> bool:
+    return bool(_CONTINUATION_RE.search(question or ""))
+
+
+def _last_substantive_user_question(
+    history: Sequence[dict] | None,
+    *,
+    current_question: str,
+) -> str | None:
+    current = (current_question or "").strip().lower()
+    for item in reversed(history or []):
+        if item.get("role") != "user":
+            continue
+        content = (item.get("content") or "").strip()
+        if not content or content.lower() == current:
+            continue
+        if _is_greeting(content) or _is_continuation_request(content):
+            continue
+        return content
+    return None
+
+
+def _intent_short_circuit(question: str, history: Sequence[dict] | None) -> RAGResponse | None:
+    if _is_greeting(question):
+        return RAGResponse(
+            answer=_GREETING_RESPONSE.answer,
+            query=question,
+        )
+
+    if _is_continuation_request(question) and not _last_substantive_user_question(
+        history,
+        current_question=question,
+    ):
+        return RAGResponse(
+            answer=_MISSING_HISTORY_RESPONSE.answer,
+            query=question,
+            error="missing_history",
+        )
+
+    return None
+
 
 # ── DB persistence helper ──────────────────────────────────────────────────────
 
@@ -76,6 +279,7 @@ def _persist_async(
     cached: bool,
     error: str | None,
     namespace: str,
+    conversation_id: str | None = None,
 ) -> None:
     """
     Write query + answer to Supabase on a background thread.
@@ -94,6 +298,7 @@ def _persist_async(
                 namespace = namespace,
                 cached    = cached,
                 error     = error,
+                conversation_id = conversation_id,
             )
         except Exception as e:
             log.error("Background DB write failed: %s", e)
@@ -110,6 +315,8 @@ def rag_query(
     *,
     namespace: str = "epstein-docs",
     skip_cache: bool = False,
+    history: Sequence[dict] | None = None,
+    conversation_id: str | None = None,
 ) -> RAGResponse:
     """
     Full RAG pipeline — returns a complete RAGResponse.
@@ -127,10 +334,47 @@ def rag_query(
         tracer.set("query", question[:200])
         tracer.set("model", cfg.llm.model)
         tracer.set("namespace", namespace)
+        effective_history = _resolve_history(
+            cache,
+            explicit_history=history,
+            conversation_id=conversation_id,
+            namespace=namespace,
+        )
+        intent_response = _intent_short_circuit(question, effective_history)
+        if intent_response:
+            _persist_async(
+                question=question,
+                answer=intent_response.answer,
+                sources=[],
+                cached=False,
+                error=intent_response.error,
+                namespace=namespace,
+                conversation_id=conversation_id,
+            )
+            _remember_turn(
+                cache,
+                conversation_id=conversation_id,
+                namespace=namespace,
+                history=effective_history,
+                question=question,
+                answer=intent_response.answer,
+            )
+            return intent_response
+
+        retrieval_query = _rewrite_for_retrieval(question, effective_history)
+        tracer.set("history_turns", len(effective_history))
+        tracer.set("conversation_id", conversation_id or "")
+        tracer.set("retrieval_query", retrieval_query[:200])
+        cache_key = _scoped_cache_key(
+            question,
+            effective_history,
+            conversation_id=conversation_id,
+            retrieval_query=retrieval_query,
+        )
 
         # ── 1. Redis cache lookup ────────────────────────────────────────────
         if not skip_cache:
-            cached_payload = cache.get(question)
+            cached_payload = cache.get(cache_key)
             if cached_payload:
                 tracer.set("cache_hit", True)
                 response = RAGResponse(
@@ -147,6 +391,15 @@ def rag_query(
                     cached    = True,
                     error     = None,
                     namespace = namespace,
+                    conversation_id = conversation_id,
+                )
+                _remember_turn(
+                    cache,
+                    conversation_id=conversation_id,
+                    namespace=namespace,
+                    history=effective_history,
+                    question=question,
+                    answer=response.answer,
                 )
                 return response
 
@@ -154,12 +407,21 @@ def rag_query(
 
         # ── 2. Stage-1 retrieval ─────────────────────────────────────────────
         with tracer.span("retrieve"):
-            chunks = retrieve_chunks(store, question)
+            chunks = retrieve_chunks(store, retrieval_query)
 
         if not chunks:
             _persist_async(
                 question=question, answer=_NO_CHUNKS_RESPONSE.answer,
                 sources=[], cached=False, error="no_chunks", namespace=namespace,
+                conversation_id=conversation_id,
+            )
+            _remember_turn(
+                cache,
+                conversation_id=conversation_id,
+                namespace=namespace,
+                history=effective_history,
+                question=question,
+                answer=_NO_CHUNKS_RESPONSE.answer,
             )
             return _NO_CHUNKS_RESPONSE
 
@@ -167,18 +429,26 @@ def rag_query(
 
         # ── 3. Stage-2 reranking ─────────────────────────────────────────────
         with tracer.span("rerank"):
-            chunks = rerank_chunks(chunks, question)
+            chunks = rerank_chunks(chunks, retrieval_query)
 
         tracer.set("chunks_after_rerank", len(chunks))
         tracer.set("sources", [c.filename for c in chunks])
 
         # ── 4. Prompt construction ────────────────────────────────────────────
-        system_prompt, user_message = build_prompt(chunks, question)
+        system_prompt, user_message = build_prompt(
+            chunks,
+            question,
+            retrieval_query=retrieval_query,
+        )
 
         # ── 5. LLM generation ─────────────────────────────────────────────────
         try:
             with tracer.span("generate"):
-                answer = generate_answer(system_prompt, user_message)
+                answer = generate_answer(
+                    system_prompt,
+                    user_message,
+                    history=effective_history,
+                )
         except RuntimeError as exc:
             log.error("Generation failed: %s", exc)
             err_response = RAGResponse(
@@ -191,6 +461,7 @@ def rag_query(
                 question=question, answer=err_response.answer,
                 sources=err_response.sources, cached=False,
                 error=str(exc), namespace=namespace,
+                conversation_id=conversation_id,
             )
             return err_response
 
@@ -204,12 +475,21 @@ def rag_query(
         )
 
         # ── 7. Redis write ────────────────────────────────────────────────────
-        cache.set(question, {"answer": answer, "sources": sources})
+        cache.set(cache_key, {"answer": answer, "sources": sources})
 
         # ── 8. Supabase write (background thread) ─────────────────────────────
         _persist_async(
             question=question, answer=answer, sources=sources,
             cached=False, error=None, namespace=namespace,
+            conversation_id=conversation_id,
+        )
+        _remember_turn(
+            cache,
+            conversation_id=conversation_id,
+            namespace=namespace,
+            history=effective_history,
+            question=question,
+            answer=answer,
         )
 
     return response
@@ -223,6 +503,8 @@ def rag_query_stream(
     *,
     namespace: str = "epstein-docs",
     skip_cache: bool = False,
+    history: Sequence[dict] | None = None,
+    conversation_id: str | None = None,
 ) -> Iterator[str]:
     """
     Streaming variant — yields answer tokens as they arrive from the LLM.
@@ -235,41 +517,111 @@ def rag_query_stream(
         )
     """
     cache = get_cache()
+    effective_history = _resolve_history(
+        cache,
+        explicit_history=history,
+        conversation_id=conversation_id,
+        namespace=namespace,
+    )
+    intent_response = _intent_short_circuit(question, effective_history)
+    if intent_response:
+        yield intent_response.answer
+        _persist_async(
+            question=question,
+            answer=intent_response.answer,
+            sources=[],
+            cached=False,
+            error=intent_response.error,
+            namespace=namespace,
+            conversation_id=conversation_id,
+        )
+        _remember_turn(
+            cache,
+            conversation_id=conversation_id,
+            namespace=namespace,
+            history=effective_history,
+            question=question,
+            answer=intent_response.answer,
+        )
+        return
+
+    retrieval_query = _rewrite_for_retrieval(question, effective_history)
+    cache_key = _scoped_cache_key(
+        question,
+        effective_history,
+        conversation_id=conversation_id,
+        retrieval_query=retrieval_query,
+    )
 
     # Cache hit → yield full text at once
-    cached_payload = cache.get(question)
+    cached_payload = cache.get(cache_key)
     if cached_payload and not skip_cache:
         log.info("Cache HIT (stream) for query='%.60s'", question)
         _persist_async(
             question=question, answer=cached_payload["answer"],
             sources=cached_payload["sources"], cached=True,
             error=None, namespace=namespace,
+            conversation_id=conversation_id,
+        )
+        _remember_turn(
+            cache,
+            conversation_id=conversation_id,
+            namespace=namespace,
+            history=effective_history,
+            question=question,
+            answer=cached_payload["answer"],
         )
         yield cached_payload["answer"]
         return
 
     # Retrieve + rerank
-    chunks = retrieve_chunks(store, question)
+    chunks = retrieve_chunks(store, retrieval_query)
     if not chunks:
         yield _NO_CHUNKS_RESPONSE.answer
+        _persist_async(
+            question=question, answer=_NO_CHUNKS_RESPONSE.answer,
+            sources=[], cached=False, error="no_chunks", namespace=namespace,
+            conversation_id=conversation_id,
+        )
+        _remember_turn(
+            cache,
+            conversation_id=conversation_id,
+            namespace=namespace,
+            history=effective_history,
+            question=question,
+            answer=_NO_CHUNKS_RESPONSE.answer,
+        )
         return
 
-    chunks = rerank_chunks(chunks, question)
-    system_prompt, user_message = build_prompt(chunks, question)
+    chunks = rerank_chunks(chunks, retrieval_query)
+    system_prompt, user_message = build_prompt(
+        chunks,
+        question,
+        retrieval_query=retrieval_query,
+    )
 
     # Stream tokens; accumulate for cache + DB write
     accumulated: list[str] = []
-    for token in stream_answer(system_prompt, user_message):
+    for token in stream_answer(system_prompt, user_message, history=effective_history):
         accumulated.append(token)
         yield token
 
     full_answer = "".join(accumulated)
     sources     = [c.to_source_dict() for c in chunks]
 
-    cache.set(question, {"answer": full_answer, "sources": sources})
+    cache.set(cache_key, {"answer": full_answer, "sources": sources})
     _persist_async(
         question=question, answer=full_answer, sources=sources,
         cached=False, error=None, namespace=namespace,
+        conversation_id=conversation_id,
+    )
+    _remember_turn(
+        cache,
+        conversation_id=conversation_id,
+        namespace=namespace,
+        history=effective_history,
+        question=question,
+        answer=full_answer,
     )
 
 
@@ -509,4 +861,3 @@ if __name__ == "__main__":
 #         for i, src in enumerate(result['sources']):
 #             print(f"  [{i+1}] {src})")
 #             print(f"       {src['preview'][:1000]}...")
-

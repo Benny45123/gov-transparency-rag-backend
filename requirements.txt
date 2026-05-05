@@ -26,3 +26,4 @@ pandas
 cohere
 pinecone-text
 redis
+pytest

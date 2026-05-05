@@ -1,0 +1,26 @@
+[
+  {
+    "question": "How many children were victimized?",
+    "expect_context": true,
+    "must_not_include": ["No relevant documents were found in the database for this query."],
+    "consistency_group": "children_victims"
+  },
+  {
+    "question": "Were children murdered or raped?",
+    "expect_context": true,
+    "must_not_include": ["No relevant documents were found in the database for this query."],
+    "consistency_group": "children_victims"
+  },
+  {
+    "question": "What does Epstein do in Palm Beach according to court documents?",
+    "expect_context": true
+  },
+  {
+    "question": "Who were Epstein's known associates?",
+    "expect_context": true
+  },
+  {
+    "question": "When did the alleged incidents at Epstein's Palm Beach house occur?",
+    "expect_context": true
+  }
+]

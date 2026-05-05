@@ -21,7 +21,7 @@ Install extras:
 # from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -72,8 +72,22 @@ def get_store():
 
 # ── Request / response schemas ─────────────────────────────────────────────────
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=1000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=200)
+    messages: list[ChatMessage] = Field(default_factory=list)
+    skip_cache: bool = False
+
+
+class StreamQueryRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=1000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=200)
+    messages: list[ChatMessage] = Field(default_factory=list)
     skip_cache: bool = False
 
 
@@ -94,6 +108,8 @@ async def query_endpoint(body: QueryRequest):
         get_store(),
         body.question,
         skip_cache=body.skip_cache,
+        history=[message.model_dump() for message in body.messages],
+        conversation_id=body.conversation_id,
     )
     return result.to_dict()
 
@@ -101,6 +117,7 @@ async def query_endpoint(body: QueryRequest):
 @app.get("/query/stream")
 async def query_stream_endpoint(
     q: Annotated[str, Query(min_length=3, max_length=1000)],
+    conversation_id: str | None = Query(default=None, min_length=1, max_length=200),
     skip_cache: bool = False,
 ):
     """
@@ -108,7 +125,27 @@ async def query_stream_endpoint(
     Use EventSource in the browser or `requests.get(..., stream=True)` in Python.
     """
     return StreamingResponse(
-        rag_query_stream(get_store(), q, skip_cache=skip_cache),
+        rag_query_stream(
+            get_store(),
+            q,
+            skip_cache=skip_cache,
+            conversation_id=conversation_id,
+        ),
+        media_type="text/x-ndjson",
+    )
+
+
+@app.post("/query/stream")
+async def query_stream_body_endpoint(body: StreamQueryRequest):
+    """Streaming endpoint with multi-turn history support."""
+    return StreamingResponse(
+        rag_query_stream(
+            get_store(),
+            body.question,
+            skip_cache=body.skip_cache,
+            history=[message.model_dump() for message in body.messages],
+            conversation_id=body.conversation_id,
+        ),
         media_type="text/x-ndjson",
     )
 
@@ -130,10 +167,18 @@ async def flush_cache():
 
 
 @app.get("/history")
-async def history(limit: int = 20, namespace: str = "epstein-docs"):
+async def history(
+    limit: int = 20,
+    namespace: str = "epstein-docs",
+    conversation_id: str | None = None,
+):
     """Return the most recent RAG queries from Supabase query_history."""
     from database import fetch_history
-    return fetch_history(limit=limit, namespace=namespace)
+    return fetch_history(
+        limit=limit,
+        namespace=namespace,
+        conversation_id=conversation_id,
+    )
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gov-transparency-rag")
 

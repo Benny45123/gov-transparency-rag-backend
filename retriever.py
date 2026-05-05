@@ -20,7 +20,6 @@ Query-type detection maps to these metadata filters.
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -71,33 +70,61 @@ class RetrievedChunk:
 
 # ── Query analysis ────────────────────────────────────────────────────────────
 
-_NUMERICAL_RE = re.compile(
-    r"\b(how much|how many|amount|total|cost|paid|price|number of|count|"
-    r"percent|percentage|million|billion)\b",
-    re.IGNORECASE,
-)
-_DATE_RE = re.compile(
-    r"\b(when|date|year|month|timeline|period|since|until|between)\b",
-    re.IGNORECASE,
-)
-_TABLE_RE = re.compile(
-    r"\b(list|table|all|who were|names of|enumerate|summarise|summarize)\b",
-    re.IGNORECASE,
-)
+_TOKEN_RE = re.compile(r"\b\w+\b")
+_DOMAIN_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "children": ("child", "minor", "minors"),
+    "child": ("children", "minor", "minors"),
+    "victimized": ("victim", "victims", "abused", "assaulted", "exploited", "harmed"),
+    "victim": ("victimized", "victims", "abused", "assaulted", "exploited"),
+    "victims": ("victim", "victimized", "abused", "assaulted", "exploited"),
+    "murdered": ("killed", "dead", "death", "homicide"),
+    "raped": ("rape", "sexual", "abuse", "assault"),
+    "abused": ("abuse", "victimized", "assaulted", "exploited"),
+}
+_BOOST_TERMS = {
+    "child", "children", "minor", "minors", "victim", "victims",
+    "victimized", "abuse", "abused", "assault", "assaulted",
+    "rape", "raped", "murder", "murdered", "killed", "homicide",
+}
 
 
-def _detect_query_type(question: str) -> Optional[dict]:
+def normalise_query(question: str) -> str:
+    """Lowercase, remove punctuation, and normalize whitespace."""
+    return " ".join(_TOKEN_RE.findall(question.lower()))
+
+
+def expand_query(question: str) -> str:
     """
-    Return a Pinecone metadata filter dict, or None (→ unfiltered search).
-    Regex is more precise than word-in-string membership checks.
+    Add a small domain-aware synonym expansion to improve recall on
+    paraphrases without replacing the user's original wording.
     """
-    if _NUMERICAL_RE.search(question):
-        return {"has_numbers": True}
-    if _DATE_RE.search(question):
-        return {"has_dates": True}
-    if _TABLE_RE.search(question):
-        return {"has_table": True}
-    return None
+    tokens = normalise_query(question).split()
+    expanded = list(tokens)
+    seen = set(tokens)
+
+    for token in tokens:
+        for synonym in _DOMAIN_SYNONYMS.get(token, ()):
+            if synonym not in seen:
+                expanded.append(synonym)
+                seen.add(synonym)
+
+    return " ".join(expanded)
+
+
+def merge_chunks(*chunk_lists: list[RetrievedChunk]) -> list[RetrievedChunk]:
+    """Deduplicate retrieved chunks while preserving first-seen order."""
+    merged: list[RetrievedChunk] = []
+    seen: set[tuple[str, int]] = set()
+
+    for chunk_list in chunk_lists:
+        for chunk in chunk_list:
+            key = (chunk.filename, chunk.chunk_index)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(chunk)
+
+    return merged
 
 
 # ── Vector store factory ───────────────────────────────────────────────────────
@@ -133,32 +160,30 @@ def retrieve_chunks(
     top_k: int | None = None,
 ) -> list[RetrievedChunk]:
     """
-    Stage-1 retrieval: ANN search with optional metadata filter + fallback.
+    Stage-1 retrieval: ANN search over the original and expanded query.
 
     Returns raw chunks (before reranking) as typed RetrievedChunk objects.
     """
     top_k = top_k or cfg.pinecone.top_k
-    ns    = cfg.pinecone.namespace
-    meta_filter = _detect_query_type(question)
+    ns = cfg.pinecone.namespace
 
-    def _search(f: dict | None) -> list[Document]:
-        kwargs: dict[str, Any] = dict(query=question, k=top_k, namespace=ns)
-        if f:
-            kwargs["filter"] = f
+    def _search(search_query: str) -> list[Document]:
+        kwargs: dict[str, Any] = dict(query=search_query, k=top_k, namespace=ns)
         return store.similarity_search(**kwargs)
 
-    docs = _search(meta_filter)
+    expanded_query = expand_query(question)
+    base_chunks = [RetrievedChunk.from_document(d) for d in _search(question)]
+    expanded_chunks: list[RetrievedChunk] = []
+    if expanded_query != normalise_query(question):
+        expanded_chunks = [RetrievedChunk.from_document(d) for d in _search(expanded_query)]
 
-    # Fallback: if the filter returned nothing, retry without it
-    if not docs and meta_filter:
-        log.warning(
-            "Metadata filter %s returned 0 results — falling back to unfiltered search",
-            meta_filter,
-        )
-        docs = _search(None)
-
-    chunks = [RetrievedChunk.from_document(d) for d in docs]
-    log.info("Stage-1 retrieved %d chunks for query='%s...'", len(chunks), question[:60])
+    chunks = merge_chunks(base_chunks, expanded_chunks)
+    log.info(
+        "Stage-1 retrieved %d chunks for query='%s...' (expanded=%s)",
+        len(chunks),
+        question[:60],
+        expanded_query != normalise_query(question),
+    )
     return chunks
 
 
@@ -245,11 +270,13 @@ def _keyword_score_rerank(
         ]
 
     q_tokens = tokenise(question)
+    expanded_tokens = tokenise(expand_query(question))
+    q_token_set = set(q_tokens)
+    expanded_token_set = set(expanded_tokens)
     if not q_tokens:
         # Degenerate case: no meaningful tokens → return deduplicated chunks as-is
         return unique[:top_n]
 
-    q_token_set = set(q_tokens)
     N = len(unique)
 
     # ── 3. Compute IDF for each question token ────────────────────────────────
@@ -259,7 +286,7 @@ def _keyword_score_rerank(
     for chunk in unique:
         tokens = tokenise(chunk.content)
         chunk_token_lists.append(tokens)
-        for t in set(tokens) & q_token_set:
+        for t in set(tokens) & expanded_token_set:
             df[t] = df.get(t, 0) + 1
 
     def idf(t: str) -> float:
@@ -279,7 +306,7 @@ def _keyword_score_rerank(
         avg_len = sum(len(tl) for tl in chunk_token_lists) / max(N, 1)
         k1, b = 1.5, 0.75
         score = 0.0
-        for t in q_token_set:
+        for t in expanded_token_set:
             if t not in token_counts:
                 continue
             tf = token_counts[t]
@@ -288,10 +315,14 @@ def _keyword_score_rerank(
 
         # Position bonus: boost if question terms appear in first 20% of chunk
         early_tokens = set(tokens[: max(1, len(tokens) // 5)])
-        early_hits = len(q_token_set & early_tokens)
+        early_hits = len(expanded_token_set & early_tokens)
         position_bonus = 0.1 * early_hits
 
-        chunk.score = round(score + position_bonus, 4)
+        boost_hits = len(_BOOST_TERMS & set(tokens) & expanded_token_set)
+        exact_hits = len(q_token_set & set(tokens))
+        semantic_bonus = 0.15 * boost_hits + 0.05 * exact_hits
+
+        chunk.score = round(score + position_bonus + semantic_bonus, 4)
 
     ranked = sorted(unique, key=lambda c: c.score, reverse=True)
     return ranked[:top_n]

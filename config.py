@@ -14,7 +14,7 @@ load_dotenv()
 class PineconeConfig:
     index_name: str = "gov-transparency-index"
     namespace: str = "epstein-docs"
-    top_k: int = 150  #fetching from pinecone, we get top 150 results, then we rerank them and trim to top_k_final before sending to the LLM
+    top_k: int = 10  #fetching from pinecone, we get top 10 results, then we rerank them and trim to top_k_final before sending to the LLM
     top_k_final: int = 5
     embedding_model: str = "gemini-embedding-001"
 
@@ -22,7 +22,7 @@ class PineconeConfig:
 class LLMConfig:
     model: str         = "llama-3.3-70b-versatile"
     max_tokens: int = 1024
-    temperature: float = 0.2
+    temperature: float = 0.0
     top_p:float = 0.9
     stream: bool = True
 

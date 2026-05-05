@@ -54,6 +54,11 @@ class RedisQueryCache:
         digest = hashlib.sha256(self._normalise(query).encode()).hexdigest()
         return f"rag:cache:{digest}"
 
+    def _conversation_key(self, namespace: str, conversation_id: str) -> str:
+        raw = f"{namespace}:{conversation_id}"
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        return f"rag:conversation:{digest}"
+
     def get(self, query: str) -> dict | None:
         client = self._get_client()
         if not client: return None
@@ -80,6 +85,47 @@ class RedisQueryCache:
         except RedisError as e:
             log.error("Cache set error: %s", e)
 
+    def get_conversation_history(
+        self,
+        conversation_id: str,
+        *,
+        namespace: str = "epstein-docs",
+    ) -> list[dict]:
+        client = self._get_client()
+        if not client:
+            return []
+
+        try:
+            raw = client.get(self._conversation_key(namespace, conversation_id))
+            if not raw:
+                return []
+            payload = json.loads(raw)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+        except (RedisError, json.JSONDecodeError) as e:
+            log.error("Conversation cache get error: %s", e)
+        return []
+
+    def set_conversation_history(
+        self,
+        conversation_id: str,
+        history: list[dict],
+        *,
+        namespace: str = "epstein-docs",
+    ) -> None:
+        client = self._get_client()
+        if not client:
+            return
+
+        try:
+            client.setex(
+                name=self._conversation_key(namespace, conversation_id),
+                time=self._ttl,
+                value=json.dumps(history, default=str),
+            )
+        except RedisError as e:
+            log.error("Conversation cache set error: %s", e)
+
     def invalidate(self, query: str) -> bool:
         client = self._get_client()
         return bool(client.delete(self._key(query))) if client else False
@@ -89,7 +135,13 @@ class RedisQueryCache:
         client = self._get_client()
         if not client: return 0
         try:
-            keys = client.keys("rag:cache:*")
+            cache_keys = client.keys("rag:cache:*")
+            conversation_keys = client.keys("rag:conversation:*")
+            if not isinstance(cache_keys, (list, tuple)):
+                cache_keys = []
+            if not isinstance(conversation_keys, (list, tuple)):
+                conversation_keys = []
+            keys = [*cache_keys, *conversation_keys]
             # If keys is not a concrete iterable (e.g. an awaitable from an async client), avoid unpacking.
             if not isinstance(keys, (list, tuple)) or not keys:
                 return 0

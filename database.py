@@ -26,6 +26,7 @@ create table if not exists processed_pdfs (
 
 create table if not exists query_history (
     id          bigserial primary key,
+    conversation_id text,
     question    text not null,
     answer      text,
     sources     jsonb,
@@ -37,6 +38,9 @@ create table if not exists query_history (
 
 create index if not exists idx_query_history_created
     on query_history (created_at desc);
+
+create index if not exists idx_query_history_conversation
+    on query_history (conversation_id, created_at desc);
 """
 from __future__ import annotations
 
@@ -138,6 +142,7 @@ def save_query(
     namespace: str = "epstein-docs",
     cached: bool = False,
     error: str | None = None,
+    conversation_id: str | None = None,
 ) -> None:
     """
     Persist a completed RAG query to query_history.
@@ -155,29 +160,44 @@ def save_query(
             if isinstance(sources, str)
             else json.dumps(sources, default=str)
         )
-        db.table("query_history").insert(
-            {
-                "question":  question,
-                "answer":    answer,
-                "sources":   sources_json,
-                "namespace": namespace,
-                "cached":    cached,
-                "error":     error,
-            }
-        ).execute()
+        
+        row = {
+            "question":  question,
+            "answer":    answer,
+            "sources":   sources_json,
+            "namespace": namespace,
+            "cached":    cached,
+            "error":     error,
+        }
+        if conversation_id:
+            row["conversation_id"] = conversation_id
+
+        try:
+            db.table("query_history").insert(row).execute()
+        except Exception as e:
+            if not conversation_id:
+                raise
+            log.warning("query_history conversation_id write failed; retrying without it: %s", e)
+            row.pop("conversation_id", None)
+            db.table("query_history").insert(row).execute()
         log.debug("Saved query to history: '%.60s'", question)
     except Exception as e:
         log.error("save_query error: %s", e)
 
 
-def fetch_history(limit: int = 10, namespace: str | None = None) -> list[dict]:
+def fetch_history(
+    limit: int = 10,
+    namespace: str | None = None,
+    conversation_id: str | None = None,
+) -> list[dict]:
     """
     Return the most recent queries from query_history, newest first.
 
     Parameters
     ----------
     limit       Max rows to return.
-    namespace   If set, filter to a specific Pinecone namespace.
+    namespace        If set, filter to a specific Pinecone namespace.
+    conversation_id  If set, filter to a specific chat session.
     """
     db = _get_client()
     if db is None:
@@ -186,10 +206,13 @@ def fetch_history(limit: int = 10, namespace: str | None = None) -> list[dict]:
         q = db.table("query_history").select("*").order("id", desc=True).limit(limit)
         if namespace:
             q = q.eq("namespace", namespace)
+        if conversation_id:
+            q = q.eq("conversation_id", conversation_id)
         res = q.execute()
         return [
             {
                 "id":         r.get("id"),
+                "conversation_id": r.get("conversation_id"),
                 "question":   r.get("question"),
                 "answer":     r.get("answer"),
                 "sources":    _safe_json_loads(r.get("sources") or "[]"),
