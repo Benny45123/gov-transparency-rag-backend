@@ -27,3 +27,5 @@ cohere
 pinecone-text
 redis
 pytest
+httpx
+python-jose[cryptography]

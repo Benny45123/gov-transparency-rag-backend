@@ -23,7 +23,7 @@ Install extras:
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query,Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -31,6 +31,8 @@ from cache import get_cache
 from query import RAGResponse, rag_query, rag_query_stream
 from retriever import build_vector_store
 from observability import get_logger
+from auth import get_current_user, require_admin, require_viewer, AuthenticatedUser
+from auth_routes import router as auth_router
 
 
 log = get_logger("api")
@@ -58,12 +60,13 @@ app = FastAPI(
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","https://gov-transparency-rag-frontend-dgbs.vercel.app"],
+    allow_origins=["http://localhost:3000",os.getenv("FRONTEND_URL", "http://localhost:8000")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 def get_store():
     if _store is None:
         raise HTTPException(status_code=503, detail="Vector store not ready")
@@ -102,7 +105,9 @@ class QueryResponse(BaseModel):
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.post("/query", response_model=QueryResponse)
-async def query_endpoint(body: QueryRequest):
+async def query_endpoint(
+    body: QueryRequest,
+    current_user: AuthenticatedUser = Depends(require_viewer)):
     """Full RAG pipeline — returns complete answer + source citations."""
     result: RAGResponse = rag_query(
         get_store(),
@@ -110,6 +115,7 @@ async def query_endpoint(body: QueryRequest):
         skip_cache=body.skip_cache,
         history=[message.model_dump() for message in body.messages],
         conversation_id=body.conversation_id,
+        user_id=current_user.user_id,
     )
     return result.to_dict()
 
@@ -119,6 +125,7 @@ async def query_stream_endpoint(
     q: Annotated[str, Query(min_length=3, max_length=1000)],
     conversation_id: str | None = Query(default=None, min_length=1, max_length=200),
     skip_cache: bool = False,
+    current_user: AuthenticatedUser = Depends(require_viewer)
 ):
     """
     Streaming endpoint — returns answer tokens as plain text/event-stream.
@@ -130,13 +137,14 @@ async def query_stream_endpoint(
             q,
             skip_cache=skip_cache,
             conversation_id=conversation_id,
+            user_id=current_user.user_id,
         ),
         media_type="text/x-ndjson",
     )
 
 
 @app.post("/query/stream")
-async def query_stream_body_endpoint(body: StreamQueryRequest):
+async def query_stream_body_endpoint(body: StreamQueryRequest, current_user: AuthenticatedUser = Depends(require_viewer)):
     """Streaming endpoint with multi-turn history support."""
     return StreamingResponse(
         rag_query_stream(
@@ -145,12 +153,13 @@ async def query_stream_body_endpoint(body: StreamQueryRequest):
             skip_cache=body.skip_cache,
             history=[message.model_dump() for message in body.messages],
             conversation_id=body.conversation_id,
+            user_id=current_user.user_id,
         ),
         media_type="text/x-ndjson",
     )
 
 
-@app.get("/health")
+@app.get("/health",dependencies=[Depends(require_admin)])
 async def health():
     cache = get_cache()
     return {
@@ -171,6 +180,7 @@ async def history(
     limit: int = 20,
     namespace: str = "epstein-docs",
     conversation_id: str | None = None,
+    current_user:AuthenticatedUser=Depends(require_viewer)
 ):
     """Return the most recent RAG queries from Supabase query_history."""
     from database import fetch_history
@@ -178,6 +188,7 @@ async def history(
         limit=limit,
         namespace=namespace,
         conversation_id=conversation_id,
+        user_id=current_user.user_id,
     )
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gov-transparency-rag")

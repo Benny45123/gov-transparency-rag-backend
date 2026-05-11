@@ -120,6 +120,7 @@ def _scoped_cache_key(
     history: Sequence[dict] | None = None,
     *,
     conversation_id: str | None = None,
+    user_id: str | None = None,
     retrieval_query: str | None = None,
 ) -> str:
     return json.dumps(
@@ -148,12 +149,14 @@ def _history_from_db(
     *,
     conversation_id: str,
     namespace: str,
+    user_id: str | None = None,
     limit: int = MAX_MEMORY_MESSAGES,
 ) -> list[dict[str, str]]:
     rows = fetch_history(
         limit=max(1, limit // 2),
         namespace=namespace,
         conversation_id=conversation_id,
+        user_id=user_id,
     )
     messages: list[dict[str, str]] = []
     for row in reversed(rows):
@@ -172,21 +175,29 @@ def _resolve_history(
     explicit_history: Sequence[dict] | None,
     conversation_id: str | None,
     namespace: str,
+    user_id: str | None = None,
 ) -> list[dict[str, str]]:
     cleaned = _clean_history(explicit_history)
     if cleaned or not conversation_id:
         return cleaned
 
     cached_history = _clean_history(
-        cache.get_conversation_history(conversation_id, namespace=namespace)
+        cache.get_conversation_history(
+            _scoped_conversation_id(conversation_id, user_id=user_id),
+            namespace=namespace,
+        )
     )
     if cached_history:
         return cached_history
 
-    db_history = _history_from_db(conversation_id=conversation_id, namespace=namespace)
+    db_history = _history_from_db(
+        conversation_id=conversation_id,
+        namespace=namespace,
+        user_id=user_id,
+    )
     if db_history:
         cache.set_conversation_history(
-            conversation_id,
+            _scoped_conversation_id(conversation_id, user_id=user_id),
             db_history,
             namespace=namespace,
         )
@@ -198,6 +209,7 @@ def _remember_turn(
     *,
     conversation_id: str | None,
     namespace: str,
+    user_id: str | None = None,
     history: Sequence[dict] | None,
     question: str,
     answer: str,
@@ -212,7 +224,17 @@ def _remember_turn(
             {"role": "assistant", "content": answer},
         ]
     )
-    cache.set_conversation_history(conversation_id, updated, namespace=namespace)
+    cache.set_conversation_history(
+        _scoped_conversation_id(conversation_id, user_id=user_id),
+        updated,
+        namespace=namespace,
+    )
+
+
+def _scoped_conversation_id(conversation_id: str, *, user_id: str | None = None) -> str:
+    if not user_id:
+        return conversation_id
+    return f"{user_id}:{conversation_id}"
 
 
 def _rewrite_for_retrieval(question: str, history: Sequence[dict] | None) -> str:
@@ -309,9 +331,9 @@ def _conversational_answer(question: str, history: Sequence[dict] | None) -> str
                     "and I will answer from the excerpts with sources."
                 ),
                 (
-                    "I am here to make the court records easier to question. I can summarize, "
-                    "compare, trace timelines, and explain what the provided excerpts do or "
-                    "do not show."
+                    "I am a document assistant here to make the court records easier to "
+                    "question. I can summarize, compare, trace timelines, and explain what "
+                    "the provided excerpts do or do not show."
                 ),
             ],
             question,
@@ -394,6 +416,7 @@ def _persist_async(
     error: str | None,
     namespace: str,
     conversation_id: str | None = None,
+    user_id: str | None = None,
 ) -> None:
     """
     Write query + answer to Supabase on a background thread.
@@ -413,6 +436,7 @@ def _persist_async(
                 cached    = cached,
                 error     = error,
                 conversation_id = conversation_id,
+                user_id = user_id,
             )
         except Exception as e:
             log.error("Background DB write failed: %s", e)
@@ -431,6 +455,7 @@ def rag_query(
     skip_cache: bool = False,
     history: Sequence[dict] | None = None,
     conversation_id: str | None = None,
+    user_id: str | None = None,
 ) -> RAGResponse:
     """
     Full RAG pipeline — returns a complete RAGResponse.
@@ -453,6 +478,7 @@ def rag_query(
             explicit_history=history,
             conversation_id=conversation_id,
             namespace=namespace,
+            user_id=user_id,
         )
         intent_response = _intent_short_circuit(question, effective_history)
         if intent_response:
@@ -464,11 +490,13 @@ def rag_query(
                 error=intent_response.error,
                 namespace=namespace,
                 conversation_id=conversation_id,
+                user_id=user_id,
             )
             _remember_turn(
                 cache,
                 conversation_id=conversation_id,
                 namespace=namespace,
+                user_id=user_id,
                 history=effective_history,
                 question=question,
                 answer=intent_response.answer,
@@ -483,6 +511,7 @@ def rag_query(
             question,
             effective_history,
             conversation_id=conversation_id,
+            user_id=user_id,
             retrieval_query=retrieval_query,
         )
 
@@ -506,11 +535,13 @@ def rag_query(
                     error     = None,
                     namespace = namespace,
                     conversation_id = conversation_id,
+                    user_id = user_id,
                 )
                 _remember_turn(
                     cache,
                     conversation_id=conversation_id,
                     namespace=namespace,
+                    user_id=user_id,
                     history=effective_history,
                     question=question,
                     answer=response.answer,
@@ -528,11 +559,13 @@ def rag_query(
                 question=question, answer=_NO_CHUNKS_RESPONSE.answer,
                 sources=[], cached=False, error="no_chunks", namespace=namespace,
                 conversation_id=conversation_id,
+                user_id=user_id,
             )
             _remember_turn(
                 cache,
                 conversation_id=conversation_id,
                 namespace=namespace,
+                user_id=user_id,
                 history=effective_history,
                 question=question,
                 answer=_NO_CHUNKS_RESPONSE.answer,
@@ -576,6 +609,7 @@ def rag_query(
                 sources=err_response.sources, cached=False,
                 error=str(exc), namespace=namespace,
                 conversation_id=conversation_id,
+                user_id=user_id,
             )
             return err_response
 
@@ -596,11 +630,13 @@ def rag_query(
             question=question, answer=answer, sources=sources,
             cached=False, error=None, namespace=namespace,
             conversation_id=conversation_id,
+            user_id=user_id,
         )
         _remember_turn(
             cache,
             conversation_id=conversation_id,
             namespace=namespace,
+            user_id=user_id,
             history=effective_history,
             question=question,
             answer=answer,
@@ -619,6 +655,7 @@ def rag_query_stream(
     skip_cache: bool = False,
     history: Sequence[dict] | None = None,
     conversation_id: str | None = None,
+    user_id: str | None = None,
 ) -> Iterator[str]:
     """
     Streaming variant — yields answer tokens as they arrive from the LLM.
@@ -636,6 +673,7 @@ def rag_query_stream(
         explicit_history=history,
         conversation_id=conversation_id,
         namespace=namespace,
+        user_id=user_id,
     )
     intent_response = _intent_short_circuit(question, effective_history)
     if intent_response:
@@ -648,11 +686,13 @@ def rag_query_stream(
             error=intent_response.error,
             namespace=namespace,
             conversation_id=conversation_id,
+            user_id=user_id,
         )
         _remember_turn(
             cache,
             conversation_id=conversation_id,
             namespace=namespace,
+            user_id=user_id,
             history=effective_history,
             question=question,
             answer=intent_response.answer,
@@ -664,6 +704,7 @@ def rag_query_stream(
         question,
         effective_history,
         conversation_id=conversation_id,
+        user_id=user_id,
         retrieval_query=retrieval_query,
     )
 
@@ -676,11 +717,13 @@ def rag_query_stream(
             sources=cached_payload["sources"], cached=True,
             error=None, namespace=namespace,
             conversation_id=conversation_id,
+            user_id=user_id,
         )
         _remember_turn(
             cache,
             conversation_id=conversation_id,
             namespace=namespace,
+            user_id=user_id,
             history=effective_history,
             question=question,
             answer=cached_payload["answer"],
@@ -696,11 +739,13 @@ def rag_query_stream(
             question=question, answer=_NO_CHUNKS_RESPONSE.answer,
             sources=[], cached=False, error="no_chunks", namespace=namespace,
             conversation_id=conversation_id,
+            user_id=user_id,
         )
         _remember_turn(
             cache,
             conversation_id=conversation_id,
             namespace=namespace,
+            user_id=user_id,
             history=effective_history,
             question=question,
             answer=_NO_CHUNKS_RESPONSE.answer,
@@ -728,11 +773,13 @@ def rag_query_stream(
         question=question, answer=full_answer, sources=sources,
         cached=False, error=None, namespace=namespace,
         conversation_id=conversation_id,
+        user_id=user_id,
     )
     _remember_turn(
         cache,
         conversation_id=conversation_id,
         namespace=namespace,
+        user_id=user_id,
         history=effective_history,
         question=question,
         answer=full_answer,

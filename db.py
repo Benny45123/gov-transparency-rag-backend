@@ -5,7 +5,7 @@ from supabase import create_client,Client
 load_dotenv()
 supabase: Client=create_client(
     os.getenv("SUPABASE_URL") or "",
-    os.getenv("SUPABASE_KEY") or ""
+    os.getenv("SUPABASE_ANON_KEY") or ""
 )
 def get_db():
     yield supabase

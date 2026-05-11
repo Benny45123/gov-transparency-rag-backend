@@ -43,6 +43,13 @@ def test_scoped_cache_key_changes_with_conversation_id():
     assert first != second
 
 
+def test_scoped_cache_key_is_shared_across_user_ids():
+    first = _scoped_cache_key("What happened?", conversation_id="chat-a", user_id="user-a")
+    second = _scoped_cache_key("What happened?", conversation_id="chat-a", user_id="user-b")
+
+    assert first == second
+
+
 def test_resolve_history_prefers_explicit_messages():
     class DummyCache:
         def get_conversation_history(self, conversation_id, *, namespace):
@@ -61,6 +68,7 @@ def test_resolve_history_prefers_explicit_messages():
 def test_resolve_history_uses_conversation_cache_before_db(monkeypatch):
     class DummyCache:
         def get_conversation_history(self, conversation_id, *, namespace):
+            assert conversation_id == "user-a:chat-a"
             return [{"role": "user", "content": "cached question"}]
 
     monkeypatch.setattr(
@@ -73,6 +81,7 @@ def test_resolve_history_uses_conversation_cache_before_db(monkeypatch):
         explicit_history=[],
         conversation_id="chat-a",
         namespace="epstein-docs",
+        user_id="user-a",
     )
 
     assert history == [{"role": "user", "content": "cached question"}]
@@ -83,6 +92,7 @@ def test_resolve_history_falls_back_to_db_and_warms_cache(monkeypatch):
 
     class DummyCache:
         def get_conversation_history(self, conversation_id, *, namespace):
+            assert conversation_id == "user-a:chat-a"
             return []
 
         def set_conversation_history(self, conversation_id, history, *, namespace):
@@ -94,7 +104,9 @@ def test_resolve_history_falls_back_to_db_and_warms_cache(monkeypatch):
         lambda **kwargs: [
             {"question": "follow up", "answer": "second answer", "error": None},
             {"question": "first question", "answer": "first answer", "error": None},
-        ],
+        ]
+        if kwargs["user_id"] == "user-a"
+        else pytest.fail("db history must be filtered by user_id"),
     )
 
     history = _resolve_history(
@@ -102,6 +114,7 @@ def test_resolve_history_falls_back_to_db_and_warms_cache(monkeypatch):
         explicit_history=[],
         conversation_id="chat-a",
         namespace="epstein-docs",
+        user_id="user-a",
     )
 
     assert history == [
@@ -110,7 +123,7 @@ def test_resolve_history_falls_back_to_db_and_warms_cache(monkeypatch):
         {"role": "user", "content": "follow up"},
         {"role": "assistant", "content": "second answer"},
     ]
-    assert cached["conversation_id"] == "chat-a"
+    assert cached["conversation_id"] == "user-a:chat-a"
     assert cached["history"] == history
 
 
