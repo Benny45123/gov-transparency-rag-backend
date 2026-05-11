@@ -35,6 +35,7 @@ async def login_google():
 async def auth_callback(
     request: Request,
     code: str | None = None,
+    redirect_to: str | None = None,
     error: str | None = None,
     error_code: str | None = None,
     error_description: str | None = None,
@@ -63,10 +64,11 @@ async def auth_callback(
         return RedirectResponse(url=f"{_url_join(FRONTEND_URL, '/auth/success')}?{params}")
 
     try:
+        exchange_redirect_to = redirect_to or _url_join(os.getenv("BACKEND_URL", "http://localhost:8000"), "/auth/callback")
         session = supabase.auth.exchange_code_for_session({
             "auth_code": code,
             "code_verifier": "",
-            "redirect_to": _url_join(os.getenv("BACKEND_URL", "http://localhost:8000"), "/auth/callback")
+            "redirect_to": exchange_redirect_to
         })
         if not session or not session.session:
             raise HTTPException(status_code=400, detail="Failed to exchange code for session")
