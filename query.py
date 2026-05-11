@@ -20,6 +20,7 @@ from __future__ import annotations
 import threading
 import json
 import re
+import hashlib
 from dataclasses import dataclass, field
 from typing import Iterator, Sequence
 
@@ -37,7 +38,19 @@ log = get_logger(__name__)
 MAX_MEMORY_MESSAGES = 10
 
 _GREETING_RE = re.compile(
-    r"^\s*(hi|hello|hey|yo|thanks|thank you|good morning|good afternoon|good evening)[!.?\s]*$",
+    r"^\s*(hi|hello|hey|yo|good morning|good afternoon|good evening)[!.?\s]*$",
+    re.IGNORECASE,
+)
+_THANKS_RE = re.compile(
+    r"^\s*(thanks|thank you|thx|appreciate it|appreciated)[!.?\s]*$",
+    re.IGNORECASE,
+)
+_IDENTITY_RE = re.compile(
+    r"\b(who are you|what are you|your name|are you (a )?(bot|chatbot|assistant)|identify yourself)\b",
+    re.IGNORECASE,
+)
+_CAPABILITY_RE = re.compile(
+    r"^\s*(what can you do|how can you help( me)?|help|help me|what do you do|your capabilities|how do you work)[?.!\s]*$",
     re.IGNORECASE,
 )
 _CONTINUATION_RE = re.compile(
@@ -77,10 +90,6 @@ class RAGResponse:
 
 _NO_CHUNKS_RESPONSE = RAGResponse(
     answer="No relevant documents were found in the database for this query.",
-)
-
-_GREETING_RESPONSE = RAGResponse(
-    answer="Hello. Ask me a question about the court document excerpts, and I will answer with cited sources.",
 )
 
 _MISSING_HISTORY_RESPONSE = RAGResponse(
@@ -207,7 +216,7 @@ def _remember_turn(
 
 
 def _rewrite_for_retrieval(question: str, history: Sequence[dict] | None) -> str:
-    if _is_greeting(question):
+    if _is_conversational_intent(question):
         return question
 
     if _is_continuation_request(question):
@@ -228,6 +237,27 @@ def _is_greeting(question: str) -> bool:
     return bool(_GREETING_RE.fullmatch(question or ""))
 
 
+def _is_thanks(question: str) -> bool:
+    return bool(_THANKS_RE.fullmatch(question or ""))
+
+
+def _is_identity_question(question: str) -> bool:
+    return bool(_IDENTITY_RE.search(question or ""))
+
+
+def _is_capability_question(question: str) -> bool:
+    return bool(_CAPABILITY_RE.fullmatch(question or ""))
+
+
+def _is_conversational_intent(question: str) -> bool:
+    return (
+        _is_greeting(question)
+        or _is_thanks(question)
+        or _is_identity_question(question)
+        or _is_capability_question(question)
+    )
+
+
 def _is_continuation_request(question: str) -> bool:
     return bool(_CONTINUATION_RE.search(question or ""))
 
@@ -244,16 +274,100 @@ def _last_substantive_user_question(
         content = (item.get("content") or "").strip()
         if not content or content.lower() == current:
             continue
-        if _is_greeting(content) or _is_continuation_request(content):
+        if _is_conversational_intent(content) or _is_continuation_request(content):
             continue
         return content
     return None
 
 
+def _pick_reply(options: Sequence[str], question: str, history: Sequence[dict] | None) -> str:
+    """
+    Choose a stable conversational variant for the current turn.
+
+    The history length is included so repeated small-talk in the same conversation
+    does not always produce the same sentence.
+    """
+    if not options:
+        return ""
+    seed = f"{question.strip().lower()}:{len(history or [])}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()
+    return options[int(digest[:8], 16) % len(options)]
+
+
+def _conversational_answer(question: str, history: Sequence[dict] | None) -> str:
+    if _is_identity_question(question):
+        return _pick_reply(
+            [
+                (
+                    "I am the Gov-Transparency document assistant. I help you inspect "
+                    "court-document excerpts, connect follow-up questions to the prior "
+                    "conversation, and return cited answers when the documents support them."
+                ),
+                (
+                    "I am a research assistant for this document database. Ask me about "
+                    "people, dates, locations, timelines, testimony, or procedural details, "
+                    "and I will answer from the excerpts with sources."
+                ),
+                (
+                    "I am here to make the court records easier to question. I can summarize, "
+                    "compare, trace timelines, and explain what the provided excerpts do or "
+                    "do not show."
+                ),
+            ],
+            question,
+            history,
+        )
+
+    if _is_capability_question(question):
+        return _pick_reply(
+            [
+                (
+                    "You can ask for summaries, timelines, named people, dates, locations, "
+                    "comparisons, counts, or follow-up detail from the court-document excerpts. "
+                    "If the excerpts do not support something, I will say so."
+                ),
+                (
+                    "I can answer document questions with citations, continue earlier topics "
+                    "when conversation history is available, and point out gaps where the "
+                    "records do not contain enough information."
+                ),
+                (
+                    "Try asking about a person, event, date range, location, or procedural "
+                    "action in the documents. I will keep the answer focused and cite the "
+                    "sources I used."
+                ),
+            ],
+            question,
+            history,
+        )
+
+    if _is_thanks(question):
+        return _pick_reply(
+            [
+                "You are welcome. Send the next document question whenever you are ready.",
+                "Glad to help. What would you like to check in the records next?",
+                "Any time. Ask me for another summary, timeline, comparison, or source-backed detail.",
+            ],
+            question,
+            history,
+        )
+
+    return _pick_reply(
+        [
+            "Hi. What would you like to find in the court-document excerpts?",
+            "Hello. Ask me about a person, date, location, timeline, or filing detail.",
+            "Hey. Give me a document question and I will answer with the relevant sources.",
+            "Good to see you. What part of the records should we inspect?",
+        ],
+        question,
+        history,
+    )
+
+
 def _intent_short_circuit(question: str, history: Sequence[dict] | None) -> RAGResponse | None:
-    if _is_greeting(question):
+    if _is_conversational_intent(question):
         return RAGResponse(
-            answer=_GREETING_RESPONSE.answer,
+            answer=_conversational_answer(question, history),
             query=question,
         )
 

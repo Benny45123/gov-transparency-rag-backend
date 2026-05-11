@@ -29,7 +29,7 @@ def save_pdf_record(filename:str,url:str,dataset:str,chunk_count:int,char_count:
         "char_count":  char_count,
     }, on_conflict="filename").execute()
 def save_query(question: str, answer: str, sources: str, namespace: str="epstein-docs"):
-    supabase.table("query_history").insert({
+    supabase.table("query_history").upsert({
         "question":  question,
         "answer":    answer,
         "sources":   json.dumps(sources) if not isinstance(sources, str) else sources,  

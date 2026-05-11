@@ -173,7 +173,7 @@ def save_query(
             row["conversation_id"] = conversation_id
 
         try:
-            db.table("query_history").insert(row).execute()
+            db.table("query_history").upsert(row).execute()
         except Exception as e:
             if not conversation_id:
                 raise

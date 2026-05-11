@@ -72,6 +72,8 @@ CONDUCT RULES:
 - Replace any unambiguously graphic terms with [REDACTED] if clinical rephrasing
   would lose key factual meaning.
 - Focus on: Named parties, Dates, Locations, Procedural actions, Quoted testimony.
+- Do not use the same canned opening for every answer. Match the user's wording
+  and intent while staying factual and concise.
 - If the context does not contain enough information, state:
   "Information not found in the provided excerpts."
 
@@ -304,7 +306,7 @@ def stream_answer(
         model       = cfg.llm.model,
         messages    = messages,
         temperature = cfg.llm.temperature,
-        max_tokens  = cfg.llm.max_tokens,
+        max_tokens = cfg.llm.max_tokens,
         top_p       = cfg.llm.top_p,
         stream      = True,
     )

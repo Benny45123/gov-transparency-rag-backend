@@ -171,7 +171,51 @@ def test_greeting_does_not_hit_retrieval(monkeypatch):
     response = rag_query(object(), "hello")
 
     assert response.sources == []
-    assert "Ask me a question" in response.answer
+    assert "document" in response.answer.lower() or "records" in response.answer.lower()
+
+
+def test_identity_question_does_not_hit_retrieval(monkeypatch):
+    def fail_retrieve(store, question):
+        raise AssertionError("identity question should not retrieve documents")
+
+    class DummyCache:
+        def get(self, key):
+            return None
+
+        def set(self, key, payload):
+            return None
+
+    monkeypatch.setattr("query.retrieve_chunks", fail_retrieve)
+    monkeypatch.setattr("query.get_cache", lambda: DummyCache())
+    monkeypatch.setattr("query._persist_async", lambda **kwargs: None)
+
+    response = rag_query(object(), "who are you")
+
+    assert response.sources == []
+    assert response.error is None
+    assert "assistant" in response.answer.lower()
+
+
+def test_capability_question_does_not_hit_retrieval(monkeypatch):
+    def fail_retrieve(store, question):
+        raise AssertionError("capability question should not retrieve documents")
+
+    class DummyCache:
+        def get(self, key):
+            return None
+
+        def set(self, key, payload):
+            return None
+
+    monkeypatch.setattr("query.retrieve_chunks", fail_retrieve)
+    monkeypatch.setattr("query.get_cache", lambda: DummyCache())
+    monkeypatch.setattr("query._persist_async", lambda **kwargs: None)
+
+    response = rag_query(object(), "what can you do?")
+
+    assert response.sources == []
+    assert response.error is None
+    assert "document" in response.answer.lower() or "records" in response.answer.lower()
 
 
 def test_continuation_without_history_asks_for_context(monkeypatch):
